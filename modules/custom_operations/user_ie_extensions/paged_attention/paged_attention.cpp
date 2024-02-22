@@ -17,7 +17,7 @@ namespace {
 
 std::shared_ptr<ov::Model> make_prefill_subgraph(std::int64_t num_heads = -1, std::int64_t num_kv_heads = -1, std::int64_t head_size = -1) {
     ov::element::Type_t type = ov::element::f32, attention_mask_type = ov::element::f32;
-    auto query = std::make_shared<ov::op::v0::Parameter>(type, ov::PartialShape({-1 /* batch */, -1 /* seq_len */, -1 /* queries per kv */, num_kv_heads, head_size}));
+    auto query = std::make_shared<ov::op::v0::Parameter>(type, ov::PartialShape({-1 /* batch */, -1 /* seq_len */, num_kv_heads, -1 /* queries per kv */, head_size}));
     auto key = std::make_shared<ov::op::v0::Parameter>(type, ov::PartialShape({-1 /* batch */, -1 /* seq_len */, num_kv_heads, 1, head_size}));
     auto value = std::make_shared<ov::op::v0::Parameter>(type, ov::PartialShape({-1 /* batch */, -1 /* seq_len */, num_kv_heads, 1, head_size}));
     auto mask = std::make_shared<ov::op::v0::Parameter>(attention_mask_type, ov::PartialShape({-1, -1, -1, -1, -1}));
@@ -196,8 +196,13 @@ bool TemplateExtension::PagedAttention::has_evaluate() const {
 }
 
 // generate buttom diagonal boolean attention bias for a prefill stage
-ov::Tensor generate_attention_bias(const std::size_t batch_size, const std::size_t seq_len, const std::size_t sliding_window) {
-    ov::Shape attention_mask_shape({batch_size, 1, 1, seq_len, seq_len});
+ov::Tensor generate_attention_bias(const std::size_t batch_size, const int64_t seq_len,
+                                   const int64_t sliding_window, const std::size_t num_kv_heads,
+                                   ov::Tensor alibi_slopes) {
+    const float * alibi_slopes_ptr = alibi_slopes.get_shape()[0] > 0 ? alibi_slopes.data<float>() : nullptr;
+    std::size_t mask_num_heads = alibi_slopes_ptr ? num_kv_heads : 1; // use broadcasting in case of non-ALiBi
+
+    ov::Shape attention_mask_shape({batch_size, 1, mask_num_heads, static_cast<size_t>(seq_len), static_cast<size_t>(seq_len)});
     ov::Tensor attention_mask(ov::element::f32, attention_mask_shape);
     int attention_mask_stride = attention_mask.get_strides()[0] / sizeof(float);
 
@@ -207,10 +212,20 @@ ov::Tensor generate_attention_bias(const std::size_t batch_size, const std::size
     for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
         float * attention_mask_data = attention_mask.data<float>() + batch_id * attention_mask_stride;
         size_t left_window = sliding_window, right_window = 1;
-        for (size_t y = 0; y < seq_len; ++y) {
-            for (size_t x = 0; x < seq_len; ++x) {
-                attention_mask_data[y * seq_len + x] = (x + right_window - 1) > y || (x + left_window - 1) < y ? negative_inf : 0.0f;
+        for (size_t head_idx = 0; head_idx < mask_num_heads; ++head_idx) {
+            float alibi_slope = alibi_slopes_ptr ? alibi_slopes_ptr[head_idx] : 0.0f;
+            for (int64_t y = 0; y < seq_len; ++y) {
+                for (int64_t x = 0; x < seq_len; ++x) {
+                    attention_mask_data[y * seq_len + x] =
+                        // process sliding window case
+                        (x + right_window - 1) > y || (x + left_window - 1) < y ? negative_inf :
+                        // process ALiBi case
+                        alibi_slopes_ptr ? (x - y) * alibi_slope :
+                        // default case
+                        0.0f;
+                }
             }
+            attention_mask_data += seq_len * seq_len;
         }
     }
 
@@ -226,16 +241,11 @@ bool TemplateExtension::PagedAttention::evaluate(ov::TensorVector& outputs, cons
     ov::Tensor context_lens = inputs[8];
     ov::Tensor block_tables = inputs[9];
     float scale = inputs[10].data<float>()[0];
-    float* alibi_slopes = inputs[11].get_shape()[0] > 0 ? inputs[11].data<float>() : nullptr;
+    ov::Tensor alibi_slopes = inputs[11];
     std::int32_t sliding_window = inputs[12].data<std::int32_t>()[0];
     if (sliding_window == 0) {
         sliding_window = std::numeric_limits<std::int32_t>::max();
     }
-
-    // std::cerr << "Alibi slopes: " << alibi_slopes << "\n";
-    // for(int i = 0; i < inputs[11].get_shape()[0]; ++i)
-    //     std::cerr << "  [" << i << "] = " << alibi_slopes[i] << "\n";
-    // std::cerr << "Sliding window: " << sliding_window << "\n";
 
     // Shapes
     ov::Shape query_shape = query.get_shape();
@@ -244,6 +254,8 @@ bool TemplateExtension::PagedAttention::evaluate(ov::TensorVector& outputs, cons
     ov::Shape value_cache_shape = value_cache.get_shape();
     const std::size_t num_kv_heads = value_cache_shape[1], head_size = value_cache_shape[2],
         num_heads = hidden_size / head_size, block_size = value_cache_shape[3];
+
+    OPENVINO_ASSERT(alibi_slopes.get_shape()[0] == 0 || alibi_slopes.get_size() == num_kv_heads);
 
     // reshape to [batch_size * seq_len, m_num_kv_heads, head_size] from [batch_size, seq_len, num_heads/m_num_kv_heads * head_size]
     void * query_data = query.data(), * key_data = key.data(), * value_data = value.data();
@@ -263,7 +275,7 @@ bool TemplateExtension::PagedAttention::evaluate(ov::TensorVector& outputs, cons
     OPENVINO_ASSERT(output_data == outputs[0].data());
 
     if (is_prompt) {
-        // reshape to [batch_size, seq_len, num_kv_heads, head_size]
+        // reshape to [batch_size, seq_len, num_kv_heads, num_queries_per_kv, head_size]
         auto num_queries_per_kv = num_heads / num_kv_heads;
         query.set_shape({batch_size, seq_len, num_kv_heads, num_queries_per_kv, head_size});
         key.set_shape({batch_size, seq_len, num_kv_heads, 1, head_size});
@@ -275,7 +287,7 @@ bool TemplateExtension::PagedAttention::evaluate(ov::TensorVector& outputs, cons
         OPENVINO_ASSERT(value_data == value.data());
         OPENVINO_ASSERT(output_data == outputs[0].data());
 
-        auto attention_bias = generate_attention_bias(batch_size, seq_len, sliding_window);
+        auto attention_bias = generate_attention_bias(batch_size, seq_len, sliding_window, num_kv_heads, alibi_slopes);
         ov::Tensor scale_tensor(ov::element::f32, ov::Shape{1}, &scale);
 
         m_prefill_request.set_input_tensor(0, query);
@@ -291,7 +303,7 @@ bool TemplateExtension::PagedAttention::evaluate(ov::TensorVector& outputs, cons
         paged_attention_v1_cpu(outputs[0],
             query, key_cache, value_cache,
             num_kv_heads, scale,
-            block_tables, context_lens,
+            block_tables, context_lens, alibi_slopes,
             block_size, max_context_len);
     }
 

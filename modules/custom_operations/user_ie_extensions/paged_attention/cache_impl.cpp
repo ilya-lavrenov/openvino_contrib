@@ -33,8 +33,6 @@ void reshape_and_cache_cpu_impl(
         scalar_t *target_value_head_ptr = value_cache +
                                           block_elem_num * block_index +
                                           head_idx * block_size * head_size;
-                                          
-        // std::cout << (block_elem_num * block_index + head_idx * block_size * head_size) << " ";
 
         for (int src_key_idx = 0; src_key_idx < head_size; src_key_idx += x) {
           const int64_t target_offset =
@@ -56,7 +54,7 @@ void reshape_and_cache_cpu_impl(
     }
   }
 }
-}; // namespace
+} // namespace
 
 void reshape_and_cache_cpu(ov::Tensor key, ov::Tensor value,
                            ov::Tensor key_cache, ov::Tensor value_cache,
